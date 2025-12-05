@@ -1,0 +1,238 @@
+#!/bin/bash
+#BSUB -J mpi_cuda_pde_test
+#BSUB -W 3:00
+#BSUB -n 40
+#BSUB -q normal
+#BSUB -o mpi_cuda_pde.%J.out
+#BSUB -e mpi_cuda_pde.%J.err
+#BSUB -R "span[ptile=20]"
+#BSUB -m "polus-c3-ib polus-c4-ib"
+#BSUB -x
+
+echo "======================================================"
+echo "MPI+CUDA Performance Test - PDE Solver"
+echo "======================================================"
+echo "Date: $(date)"
+echo "Hostname: $(hostname)"
+echo ""
+
+# ---------- 1. 加载模块 ----------
+module load OpenMPI/4.0.2
+
+# ---------- 2. 编译程序（用 Makefile） ----------
+echo "[INFO] Cleaning and building with Makefile..."
+make clean
+# 注意：这里用 HOST_COMP=mpicxx，避免 C++ 标准库链接问题
+make ARCH=sm_60 HOST_COMP=mpicxx
+
+EXECUTABLE_NAME="./shishi1"
+
+# ---------- 3. 问题规模 & 进程数组 ----------
+
+# Set 1: M=400, N=600, Procs = 1 2 4 8 16
+SET1_M=400
+SET1_N=600
+PROCESS_COUNTS_SET1=(1 2 4 8 16)
+
+# Set 2: M=800, N=1200, Procs = 2 4 8 16 32
+SET2_M=800
+SET2_N=1200
+PROCESS_COUNTS_SET2=(2 4 8 16 32)
+
+# ---------- 4. 节点 & socket 信息（和 -m / span 对应） ----------
+SOCKETS_PER_NODE=2      # 每个节点上有几个 CPU socket（你可以根据机器调整）
+TARGET_NODES=2          # 上面 -m 指定了 2 个节点
+TOTAL_SOCKETS=$((SOCKETS_PER_NODE * TARGET_NODES))
+
+if [ -z "$TOTAL_SOCKETS" ] || [ "$TOTAL_SOCKETS" -le 0 ]; then
+  echo "[WARN] TOTAL_SOCKETS invalid='$TOTAL_SOCKETS', fallback to 4"
+  TOTAL_SOCKETS=4
+fi
+
+# ---------- 5. 通用函数：给定 M,N 和一组 procs，自动跑实验 ----------
+run_problem_set() {
+  local M=$1
+  local N=$2
+  shift 2
+  local PROCS_LIST=("$@")
+
+  local RESULT_FILE="mpi_cuda_M${M}_N${N}_results.txt"
+  local DETAIL_FILE="mpi_cuda_M${M}_N${N}_details.txt"
+
+  echo "======================================================"
+  echo "Problem set: M=${M}, N=${N}"
+  echo "Result file : ${RESULT_FILE}"
+  echo "Detail file : ${DETAIL_FILE}"
+  echo "======================================================"
+
+  > "$RESULT_FILE"
+  > "$DETAIL_FILE"
+
+  # ---- 测试配置信息 ----
+  echo "=== Test Configuration ===" >> "$RESULT_FILE"
+  echo "Node: $(hostname)"          >> "$RESULT_FILE"
+  echo "Date: $(date)"             >> "$RESULT_FILE"
+  echo "Problem Size: M=$M, N=$N"  >> "$RESULT_FILE"
+  echo "Parallel mode: MPI + CUDA" >> "$RESULT_FILE"
+  echo ""                          >> "$RESULT_FILE"
+
+  # ---- 硬件信息（详情文件中） ----
+  echo "=== CPU Information ===" >> "$DETAIL_FILE"
+  lscpu >> "$DETAIL_FILE" 2>&1
+  echo "" >> "$DETAIL_FILE"
+  echo "=== NUMA Configuration ===" >> "$DETAIL_FILE"
+  numactl --hardware >> "$DETAIL_FILE" 2>&1 || echo "numactl not available" >> "$DETAIL_FILE"
+  echo "" >> "$DETAIL_FILE"
+
+  # ---- 结果表头：每次运行一行 ----
+  printf "%-6s| %-4s| %-12s| %s\n" \
+    "Procs" "Run" "Time(s)" "Status" >> "$RESULT_FILE"
+  echo "------|-----|--------------|--------" >> "$RESULT_FILE"
+
+  # ---- 主循环：遍历所有进程数 ----
+  for procs in "${PROCS_LIST[@]}"; do
+    echo ""
+    echo "Testing M=${M}, N=${N} with $procs MPI processes"
+    echo "================================================================"
+
+    echo "" >> "$DETAIL_FILE"
+    echo "=== Testing with $procs MPI processes (M=$M, N=$N) ===" >> "$DETAIL_FILE"
+
+    # 小并行度：每个 socket 最多 1 个 rank
+    if [ "$procs" -le "$((TARGET_NODES * SOCKETS_PER_NODE))" ]; then
+      MPI_MAP="--map-by ppr:1:socket"
+      MPI_STRATEGY="$MPI_MAP --bind-to core"
+      STRATEGY_DESC="Mapping: ${MPI_MAP}, bind-to core (small procs, 1 rank per socket)"
+    else
+      # 大并行度：每个 socket 上允许多个 rank
+      ppr=$(( (procs + TOTAL_SOCKETS - 1) / TOTAL_SOCKETS ))
+      MPI_MAP="--map-by ppr:${ppr}:socket"
+      MPI_STRATEGY="$MPI_MAP --bind-to core"
+      STRATEGY_DESC="Mapping: ${MPI_MAP}, bind-to core (TOTAL_SOCKETS=${TOTAL_SOCKETS})"
+    fi
+
+    echo "Strategy: $MPI_STRATEGY"
+    echo "=== Strategy: $STRATEGY_DESC ===" >> "$DETAIL_FILE"
+
+    # 每种进程数跑 3 次
+    for run in 1 2 3; do
+      echo "  Run $run of 3..."
+
+      TEMP_OUT="/tmp/mpi_cuda_temp_${M}x${N}_${procs}p_${run}.out"
+
+      mpirun -np "$procs" \
+        $MPI_STRATEGY \
+        --report-bindings \
+        $EXECUTABLE_NAME "$M" "$N" \
+        > "$TEMP_OUT" 2>&1
+
+      # 从你的程序输出里抓取总时间:
+      # "Total wall time (MPI_Init..Finalize) [max over ranks]: 22.362120"
+      EXEC_TIME=$(grep "Total wall time (MPI_Init..Finalize)" "$TEMP_OUT" | tail -1 | awk -F':' '{print $2}' | xargs)
+      [ -z "$EXEC_TIME" ] && EXEC_TIME="N/A"
+
+      if [ "$EXEC_TIME" = "N/A" ]; then
+        STATUS="Failed"
+      else
+        STATUS="Success"
+      fi
+
+      printf "%-6s| %-4s| %-12s| %s\n" \
+             "$procs" "$run" "$EXEC_TIME" "$STATUS" >> "$RESULT_FILE"
+
+      echo "" >> "$DETAIL_FILE"
+      echo "----- Output for procs=$procs run=$run -----" >> "$DETAIL_FILE"
+      cat "$TEMP_OUT" >> "$DETAIL_FILE"
+      rm -f "$TEMP_OUT"
+
+      echo "    Time: ${EXEC_TIME} s, Status: ${STATUS}"
+    done
+
+  done
+
+  # ---- 平均时间表 ----
+  echo "" >> "$RESULT_FILE"
+  echo "==========================================" >> "$RESULT_FILE"
+  echo "Performance Summary Tables for M=$M, N=$N" >> "$RESULT_FILE"
+  echo "==========================================" >> "$RESULT_FILE"
+
+  echo "" >> "$RESULT_FILE"
+  echo "=== Average Performance (Time) ===" >> "$RESULT_FILE"
+  printf "%-6s| %-16s| %-16s| %-16s\n" \
+         "Procs" "Avg Time(s)" "Min Time(s)" "Max Time(s)" >> "$RESULT_FILE"
+  echo "------|------------------|------------------|------------------" >> "$RESULT_FILE"
+
+  for procs in "${PROCS_LIST[@]}"; do
+    VALUES=$(awk -F'|' -v p="$procs" '
+      $1 ~ "^"p"[[:space:]]*$" {
+        gsub(/ /,"",$3);
+        if($3 != "N/A") print $3
+      }' "$RESULT_FILE")
+
+    if [ -n "$VALUES" ]; then
+      AVG=$(echo "$VALUES" | awk '{sum+=$1; count++} END {if(count>0) printf "%.6f", sum/count}')
+      MIN=$(echo "$VALUES" | sort -n | head -1)
+      MAX=$(echo "$VALUES" | sort -n | tail -1)
+      printf "%-6s| %-16s| %-16s| %-16s\n" \
+             "$procs" "$AVG" "$MIN" "$MAX" >> "$RESULT_FILE"
+    fi
+  done
+
+  # ---- Speedup / Efficiency（以最小进程数为 baseline）----
+  echo "" >> "$RESULT_FILE"
+  echo "=== Speedup Analysis (Based on Time) ===" >> "$RESULT_FILE"
+
+  BASE_PROCS=${PROCS_LIST[0]}
+  BASE_TIME=$(awk -F'|' -v p="$BASE_PROCS" '
+    $1 ~ "^"p"[[:space:]]*$" {
+      gsub(/ /,"",$3);
+      if($3 != "N/A"){sum+=$3; count++}
+    }
+    END {if(count>0) printf "%.6f", sum/count}
+  ' "$RESULT_FILE")
+
+  if [ -n "$BASE_TIME" ]; then
+    echo "Baseline: Procs=$BASE_PROCS, Time=${BASE_TIME} s" >> "$RESULT_FILE"
+    echo "" >> "$RESULT_FILE"
+    echo "Procs | Avg Time(s) | Speedup | Efficiency(%)" >> "$RESULT_FILE"
+    echo "------|-------------|---------|---------------" >> "$RESULT_FILE"
+
+    for procs in "${PROCS_LIST[@]}"; do
+      AVG_TIME=$(awk -F'|' -v p="$procs" '
+        $1 ~ "^"p"[[:space:]]*$" {
+          gsub(/ /,"",$3);
+          if($3 != "N/A"){sum+=$3; count++}
+        }
+        END {if(count>0) printf "%.6f", sum/count}
+      ' "$RESULT_FILE")
+
+      if [ -n "$AVG_TIME" ] && [ "$(echo "$AVG_TIME > 0" | bc)" -eq 1 ]; then
+        SPEEDUP=$(echo "scale=6; $BASE_TIME / $AVG_TIME" | bc)
+        EFFICIENCY=$(echo "scale=2; ($SPEEDUP / $procs) * 100" | bc)
+
+        printf "%-6s| %-11s| %-7s| %-13.2f\n" \
+               "$procs" "$AVG_TIME" "$SPEEDUP" "$EFFICIENCY" >> "$RESULT_FILE"
+      fi
+    done
+  fi
+
+  echo "" >> "$RESULT_FILE"
+  echo "Test for M=$M, N=$N completed at: $(date)" >> "$RESULT_FILE"
+  echo ""
+}
+
+# ---------- 6. 实际执行两组问题规模 ----------
+
+run_problem_set $SET1_M $SET1_N "${PROCESS_COUNTS_SET1[@]}"
+run_problem_set $SET2_M $SET2_N "${PROCESS_COUNTS_SET2[@]}"
+
+echo ""
+echo "=========================================="
+echo "All tests completed!"
+echo "Results in:"
+echo "  mpi_cuda_M400_N600_results.txt"
+echo "  mpi_cuda_M800_N1200_results.txt"
+echo "Details in:"
+echo "  mpi_cuda_M400_N600_details.txt"
+echo "  mpi_cuda_M800_N1200_details.txt"
+echo "=========================================="
